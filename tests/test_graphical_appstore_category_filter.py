@@ -327,9 +327,10 @@ class TestGraphicalAppStoreCategoryFilter(unittest.TestCase):
                           "Should reset _selected_category to None")
 
     def test_installed_filter_does_not_leak_remote_apps_during_phase2(self):
-        """When _selected_category is 'Installed', _insert_app_list_item for an
-        uninstalled app must not make it visible. Phase 2 inserts remote-only
-        apps — they should stay hidden under the 'Installed' filter."""
+        """When _selected_category is 'Installed', a remote-only app merged
+        during Phase 2 must not become visible. The merge only touches
+        self.apps in memory; visibility is decided by the Phase 2 full
+        rebuild, which skips uninstalled apps under 'Installed'."""
         AppManager.start_app("com.micropythonos.appstore")
         wait_for_render(iterations=40)
         activity = _get_appstore_activity()
@@ -362,10 +363,26 @@ class TestGraphicalAppStoreCategoryFilter(unittest.TestCase):
             "Remote app should not be visible under 'Installed' filter",
         )
 
-        activity.apps.insert(1, remote_app)
-        activity._insert_app_list_item(remote_app, 1)
+        # Simulate the Phase 2 memory merge (sorted, no widgets built).
+        activity.apps.extend([remote_app])
+        keyed = [(activity._sort_key(a.name), a) for a in activity.apps]
+        keyed.sort(key=lambda t: t[0])
+        activity.apps = [a for _, a in keyed]
         wait_for_render(iterations=10)
 
+        self.assertIsNone(
+            find_label_with_text(lv.screen_active(), "RemoteApp"),
+            "Remote app leaked into 'Installed' view before rebuild",
+        )
+
+        # Simulate the Phase 2 final rebuild.
+        activity.create_apps_list()
+        wait_for_render(iterations=10)
+
+        self.assertIsNotNone(
+            find_label_with_text(lv.screen_active(), "InstalledApp"),
+            "Installed app should stay visible after rebuild",
+        )
         self.assertIsNone(
             find_label_with_text(lv.screen_active(), "RemoteApp"),
             "Remote app leaked into 'Installed' view",

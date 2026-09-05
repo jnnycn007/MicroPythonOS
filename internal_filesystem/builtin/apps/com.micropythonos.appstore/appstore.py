@@ -1,5 +1,6 @@
-import json
 import logging
+import time
+import ujson
 
 import lvgl as lv
 
@@ -136,6 +137,11 @@ class AppStore(Activity):
         elif self._data_loaded and hasattr(self, "apps_list") and self.apps_list:
             self._stop_all_timers()
             self._icon_queue.clear()
+            if self._icon_pipeline != "none" and any(getattr(app, "image_icon_widget", None) is None for app in self.apps):
+                # Rows were built while icons were disabled and have no icon
+                # slots: rebuild once with slots (re-queues icons as needed).
+                self.create_apps_list()
+                return
             for app in self.apps:
                 if not app.image_icon_widget:
                     continue
@@ -383,6 +389,10 @@ class AppStore(Activity):
         self._icon_queue.clear()
         self._download_in_progress = False
         if new_value != 'none' and hasattr(self, "apps_list") and self.apps_list:
+            if any(getattr(app, "image_icon_widget", None) is None for app in self.apps):
+                # Rows were built while icons were disabled: onResume rebuilds
+                # them with icon slots when this activity is visible again.
+                return
             for app in self.apps:
                 if not app.icon_data:
                     self._icon_queue.append((app, 'raw'))
@@ -409,8 +419,12 @@ class AppStore(Activity):
 
     async def download_app_index(self, json_url):
         await TaskManager.sleep(0)
+        if __debug__:
+            _t_refresh = time.ticks_ms()
 
         # Phase 1: always show installed apps first (no network needed)
+        if __debug__:
+            _t_phase1 = time.ticks_ms()
         self.apps.clear()
         self._wip_apps.clear()
         self._builtin_fullnames = set()
@@ -427,6 +441,9 @@ class AppStore(Activity):
         self._data_loaded = True
         self.create_apps_list()
         self._update_category_dropdown()
+        if __debug__:
+            _n_phase1 = len(self.apps)
+            logger.debug("appstore-perf: phase1 installed-apps list took=%dms n=%d", time.ticks_diff(time.ticks_ms(), _t_phase1), _n_phase1)
 
         # A deep link to an app that is already known locally (e.g. installed)
         # can open its detail screen right now, without waiting for the index
@@ -434,18 +451,29 @@ class AppStore(Activity):
         self._try_early_deeplink()
 
         # Phase 2: download store index and merge in new apps
+        if __debug__:
+            _t_net = time.ticks_ms()
         try:
             response = await DownloadManager.download_url(json_url)
         except Exception as e:
             if __debug__: logger.debug("store index unavailable (%s), showing installed apps only", e)
             self._resolve_pending_deeplink(index_available=False)
             return
+        if __debug__:
+            _net_took = time.ticks_diff(time.ticks_ms(), _t_net)
+            _net_bytes = len(response) if response is not None else -1
+            logger.debug("appstore-perf: phase2 network fetch took=%dms bytes=%d", _net_took, _net_bytes)
+            _t_parse = time.ticks_ms()
         try:
-            parsed = json.loads(response)
+            parsed = ujson.loads(response)
         except Exception as e:
             logger.warning("could not parse store index: %s", e)
             self._resolve_pending_deeplink(index_available=False)
             return
+        if __debug__:
+            _n_parsed = len(parsed) if parsed is not None else -1
+            logger.debug("appstore-perf: phase2 json parse took=%dms entries=%d", time.ticks_diff(time.ticks_ms(), _t_parse), _n_parsed)
+            _t_merge = time.ticks_ms()
 
         installed_by_fullname = {app.fullname: app for app in self.apps}
         new_apps = []
@@ -475,25 +503,43 @@ class AppStore(Activity):
                 new_apps.append(app)
             except Exception as e:
                 logger.warning("could not process store app %s: %s", app_data.get("slug", "?"), e)
+        if __debug__:
+            logger.debug("appstore-perf: phase2 merge took=%dms new=%d wip=%d", time.ticks_diff(time.ticks_ms(), _t_merge), len(new_apps), len(self._wip_apps))
 
-        # Insert new apps at their sorted positions (avoids rebuilding entire list)
+        # Merge new apps in memory (sorted once) and build the visible list
+        # exactly once below. Per-app widget insertion here would only be
+        # deleted again by the mandatory full rebuild for rating labels.
         # If the activity is no longer in the foreground (e.g. test called
-        # back_screen() while the download was in flight), the list widgets may
-        # have been deleted — inserting into a stale list can segfault LVGL.
+        # back_screen() while the download was in flight), skip the rebuild:
+        # acting on deleted LVGL objects can segfault the device.
         if not self.has_foreground():
             self._resolve_pending_deeplink()
             return
-        for app in new_apps:
-            idx = self._find_sorted_insert_index(app)
-            self.apps.insert(idx, app)
-            self._insert_app_list_item(app, idx)
+        if __debug__:
+            _t_merge_apps = time.ticks_ms()
+        if new_apps:
+            self.apps.extend(new_apps)
+            keyed = [(self._sort_key(a.name), a) for a in self.apps]
+            keyed.sort(key=lambda t: t[0])
+            self.apps = [a for _, a in keyed]
+        if __debug__:
+            logger.debug("appstore-perf: phase2 sort took=%dms n=%d", time.ticks_diff(time.ticks_ms(), _t_merge_apps), len(new_apps))
 
         # ponytail: rebuild whole list so installed apps get their rating labels
         # (ratings were patched after Phase 1 already painted the list)
         if self.has_foreground():
+            if __debug__:
+                _t_rebuild = time.ticks_ms()
             self.create_apps_list()
+            if __debug__:
+                logger.debug("appstore-perf: phase2 full rebuild took=%dms", time.ticks_diff(time.ticks_ms(), _t_rebuild))
+                _t_dropdown = time.ticks_ms()
             self._update_category_dropdown()
+            if __debug__:
+                logger.debug("appstore-perf: phase2 dropdown took=%dms", time.ticks_diff(time.ticks_ms(), _t_dropdown))
         self._resolve_pending_deeplink()
+        if __debug__:
+            logger.debug("appstore-perf: refresh total took=%dms apps=%d", time.ticks_diff(time.ticks_ms(), _t_refresh), len(self.apps))
 
     def create_apps_list(self):
         if __debug__: logger.debug("create_apps_list")
@@ -530,6 +576,9 @@ class AppStore(Activity):
         self._icon_widgets = {}
         self._update_labels = {}
         if __debug__: logger.debug("create_apps_list iterating")
+        if __debug__:
+            _t_rows = time.ticks_ms()
+            _n_rows = 0
         sel_cat = getattr(self, "_selected_category", None)
         apps_to_show = self._wip_apps if sel_cat == "Work In Progress" else self.apps
         installed_set = set()
@@ -553,44 +602,48 @@ class AppStore(Activity):
                         continue
                 elif not app.categories or sel_cat not in app.categories:
                     continue
-            if __debug__: logger.debug(app)
             item = self.apps_list.add_button(None, "")
             item.set_style_pad_all(0, lv.PART.MAIN)
             item.set_size(lv.pct(100), lv.SIZE_CONTENT)
+            item.set_flex_flow(lv.FLEX_FLOW.ROW)
             self._add_click_handler(item, self.show_app_detail, app)
-            cont = lv.obj(item)
-            cont.set_style_pad_all(0, lv.PART.MAIN)
-            cont.set_flex_flow(lv.FLEX_FLOW.ROW)
-            cont.set_size(lv.pct(100), lv.SIZE_CONTENT)
-            cont.set_scrollbar_mode(lv.SCROLLBAR_MODE.OFF)
-            self._apply_default_styles(cont)
-            self._add_click_handler(cont, self.show_app_detail, app)
-            icon_spacer = lv.image(cont)
-            icon_spacer.set_size(self._ICON_SIZE, self._ICON_SIZE)
-            self._add_click_handler(icon_spacer, self.show_app_detail, app)
-            app.image_icon_widget = icon_spacer
-            if app.icon_data:
-                self._set_icon_widget(app)
-            elif self._restore_cached_icon(app, icon_spacer):
-                pass
-            elif self._icon_pipeline != 'none':
-                self._icon_queue.append((app, 'raw'))
-            label_cont = lv.obj(cont)
+            # add_button() always creates an empty auto label child (see
+            # lv_list_add_button in lvgl lv_list.c). As a ROW flex item with
+            # flex_grow 1 it would eat all free space, so remove it. With
+            # icon=None it is child 0: nothing else was added yet.
+            if item.get_child_count() > 0:
+                item.get_child(0).delete()
+            if self._icon_pipeline == "none":
+                app.image_icon_widget = None
+            else:
+                icon_spacer = lv.image(item)
+                icon_spacer.set_size(self._ICON_SIZE, self._ICON_SIZE)
+                app.image_icon_widget = icon_spacer
+                if app.icon_data:
+                    self._set_icon_widget(app)
+                elif self._restore_cached_icon(app, icon_spacer):
+                    pass
+                else:
+                    self._icon_queue.append((app, 'raw'))
+            label_cont = lv.obj(item)
             self._apply_default_styles(label_cont)
             label_cont.set_flex_flow(lv.FLEX_FLOW.COLUMN)
             label_cont.set_style_pad_ver(10, lv.PART.MAIN)
             label_cont.set_size(lv.pct(75), lv.SIZE_CONTENT)
-            self._add_click_handler(label_cont, self.show_app_detail, app)
+            # Every lv.obj is CLICKABLE by default (see lv_obj_init in lvgl
+            # lv_obj.c), so row taps land on these containers. The single
+            # CLICKED handler on the item covers the whole row only if the
+            # containers let the event bubble up to it.
+            label_cont.add_flag(lv.obj.FLAG.EVENT_BUBBLE)
             name_row = lv.obj(label_cont)
             self._apply_default_styles(name_row)
             name_row.set_flex_flow(lv.FLEX_FLOW.ROW)
             name_row.set_size(lv.pct(100), lv.SIZE_CONTENT)
-            self._add_click_handler(name_row, self.show_app_detail, app)
+            name_row.add_flag(lv.obj.FLAG.EVENT_BUBBLE)
             name_label = lv.label(name_row)
             name_label.set_text(app.name)
             name_label.set_style_text_font(lv.font_montserrat_16, lv.PART.MAIN)
             name_label.set_flex_grow(1)
-            self._add_click_handler(name_label, self.show_app_detail, app)
             rating_avg = getattr(app, "rating_average", None)
             if rating_avg is not None and rating_avg > 0:
                 rating_label = lv.label(name_row)
@@ -600,15 +653,22 @@ class AppStore(Activity):
             desc_label = lv.label(label_cont)
             desc_label.set_text(app.short_description)
             desc_label.set_style_text_font(lv.font_montserrat_12, lv.PART.MAIN)
-            self._add_click_handler(desc_label, self.show_app_detail, app)
             update_label = lv.label(label_cont)
             update_label.set_text("Update available")
             update_label.set_style_text_font(lv.font_montserrat_12, lv.PART.MAIN)
             update_label.set_style_text_color(lv.palette_main(lv.PALETTE.GREEN), lv.PART.MAIN)
             update_label.add_flag(lv.obj.FLAG.HIDDEN)
             self._update_labels[app.fullname] = update_label
+            if __debug__:
+                _n_rows += 1
+                if _n_rows % 20 == 0:
+                    logger.debug("appstore-perf: create_apps_list progress rows=%d took=%dms", _n_rows, time.ticks_diff(time.ticks_ms(), _t_rows))
+        if __debug__:
+            logger.debug("appstore-perf: create_apps_list rows took=%dms rows=%d", time.ticks_diff(time.ticks_ms(), _t_rows), _n_rows)
         if self._icon_queue:
             self._raw_timer = lv.timer_create(self._process_icon_queue, self._GENERATE_APP_ICON_BENCHMARK*self._WAIT_FACTOR_APP_ICON, None)
+        if __debug__:
+            _t_updates = time.ticks_ms()
         try:
             from appstore_core import AppUpdateManager, AppUpdateState
             updatable = []
@@ -633,111 +693,14 @@ class AppStore(Activity):
             self._sync_update_banner(state, updatable)
         except Exception:
             pass
+        if __debug__:
+            logger.debug("appstore-perf: create_apps_list update-check took=%dms", time.ticks_diff(time.ticks_ms(), _t_updates))
         if __debug__: logger.debug("create_apps_list done")
 
     _SORT_STRIP = "!\"'?:;.,@#$%^&*()-_=+[]{}\\|`~<>/"
 
     def _sort_key(self, name):
         return name.lstrip(self._SORT_STRIP).lower()
-
-    def _find_sorted_insert_index(self, app):
-        app_key = self._sort_key(app.name)
-        for i, existing in enumerate(self.apps):
-            if app_key < self._sort_key(existing.name):
-                return i
-        return len(self.apps)
-
-    def _insert_app_list_item(self, app, index):
-        """Create LVGL widgets for an app and insert at the given index in the list."""
-        if not hasattr(self, "apps_list") or not self.apps_list:
-            return
-        if not self.has_foreground():
-            return
-        sel_cat = getattr(self, "_selected_category", None)
-        if sel_cat == "Installed":
-            if app.installed_path is None:
-                return
-        elif sel_cat == "Updates":
-            try:
-                from appstore_core import AppUpdateManager
-                updatable_set = {a.get("fullname") for a in (AppUpdateManager.get_instance().updatable_apps or [])}
-            except Exception:
-                updatable_set = set()
-            if app.fullname not in updatable_set:
-                return
-        elif sel_cat and sel_cat not in AppStore._SPECIAL_CATEGORIES:
-            if not app.categories or sel_cat not in app.categories:
-                return
-        item = self.apps_list.add_button(None, "")
-        item.set_style_pad_all(0, lv.PART.MAIN)
-        item.set_size(lv.pct(100), lv.SIZE_CONTENT)
-        self._add_click_handler(item, self.show_app_detail, app)
-        cont = lv.obj(item)
-        cont.set_style_pad_all(0, lv.PART.MAIN)
-        cont.set_flex_flow(lv.FLEX_FLOW.ROW)
-        cont.set_size(lv.pct(100), lv.SIZE_CONTENT)
-        cont.set_scrollbar_mode(lv.SCROLLBAR_MODE.OFF)
-        self._apply_default_styles(cont)
-        self._add_click_handler(cont, self.show_app_detail, app)
-        icon_spacer = lv.image(cont)
-        icon_spacer.set_size(self._ICON_SIZE, self._ICON_SIZE)
-        self._add_click_handler(icon_spacer, self.show_app_detail, app)
-        app.image_icon_widget = icon_spacer
-        if app.icon_data:
-            self._set_icon_widget(app)
-        elif self._restore_cached_icon(app, icon_spacer):
-            pass
-        elif self._icon_pipeline != 'none':
-            self._icon_queue.append((app, 'raw'))
-            if not self._raw_timer:
-                self._raw_timer = lv.timer_create(self._process_icon_queue, self._GENERATE_APP_ICON_BENCHMARK*self._WAIT_FACTOR_APP_ICON, None)
-        label_cont = lv.obj(cont)
-        self._apply_default_styles(label_cont)
-        label_cont.set_flex_flow(lv.FLEX_FLOW.COLUMN)
-        label_cont.set_style_pad_ver(10, lv.PART.MAIN)
-        label_cont.set_size(lv.pct(75), lv.SIZE_CONTENT)
-        self._add_click_handler(label_cont, self.show_app_detail, app)
-        name_row = lv.obj(label_cont)
-        self._apply_default_styles(name_row)
-        name_row.set_flex_flow(lv.FLEX_FLOW.ROW)
-        name_row.set_size(lv.pct(100), lv.SIZE_CONTENT)
-        self._add_click_handler(name_row, self.show_app_detail, app)
-        name_label = lv.label(name_row)
-        name_label.set_text(app.name)
-        name_label.set_style_text_font(lv.font_montserrat_16, lv.PART.MAIN)
-        name_label.set_flex_grow(1)
-        self._add_click_handler(name_label, self.show_app_detail, app)
-        rating_avg = getattr(app, "rating_average", None)
-        if rating_avg is not None and rating_avg > 0:
-            rating_label = lv.label(name_row)
-            rating_label.set_text("%s %.1f" % (STAR_SYMBOL, rating_avg))
-            rating_label.set_style_text_font(lv.font_montserrat_12, lv.PART.MAIN)
-            rating_label.set_size(lv.SIZE_CONTENT, lv.SIZE_CONTENT)
-        desc_label = lv.label(label_cont)
-        desc_label.set_text(app.short_description)
-        desc_label.set_style_text_font(lv.font_montserrat_12, lv.PART.MAIN)
-        self._add_click_handler(desc_label, self.show_app_detail, app)
-        update_label = lv.label(label_cont)
-        update_label.set_text("Update available")
-        update_label.set_style_text_font(lv.font_montserrat_12, lv.PART.MAIN)
-        update_label.set_style_text_color(lv.palette_main(lv.PALETTE.GREEN), lv.PART.MAIN)
-        update_label.add_flag(lv.obj.FLAG.HIDDEN)
-        self._update_labels[app.fullname] = update_label
-        item.move_to_index(index)
-        sel_cat = getattr(self, "_selected_category", None)
-        if sel_cat == "Installed" and not app.installed_path:
-            item.add_flag(lv.obj.FLAG.HIDDEN)
-        elif sel_cat == "Updates":
-            try:
-                from appstore_core import AppUpdateManager
-                updatable_set = {a.get("fullname") for a in (AppUpdateManager.get_instance().updatable_apps or [])}
-            except Exception:
-                updatable_set = set()
-            if app.fullname not in updatable_set:
-                item.add_flag(lv.obj.FLAG.HIDDEN)
-        elif sel_cat and sel_cat not in ("All", "Work In Progress"):
-            if not app.categories or sel_cat not in app.categories:
-                item.add_flag(lv.obj.FLAG.HIDDEN)
 
     def _stop_all_timers(self):
         if self._raw_timer:
@@ -960,7 +923,6 @@ class AppStore(Activity):
     @staticmethod
     def badgehub_app_to_mpos_app(bhapp):
         name = bhapp.get("name")
-        if __debug__: logger.debug("got app name: %s", name)
         short_description = bhapp.get("description")
         fullname = bhapp.get("slug")
         icon_url = None

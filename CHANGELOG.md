@@ -1,6 +1,9 @@
 Future release (next version)
 =====
 
+Builtin Apps:
+- AppStore: speedup loading from 18 to 9 seconds
+
 0.18.0
 ======
 
