@@ -4,7 +4,7 @@ import ujson
 
 import lvgl as lv
 
-from mpos import Activity, App, AppManager, BuildInfo, Intent, DownloadManager, SettingsActivity, SharedPreferences, TaskManager
+from mpos import Activity, App, AppManager, BuildInfo, DisplayMetrics, Intent, DownloadManager, SettingsActivity, SharedPreferences, TaskManager
 from mpos.ui import QR_SYMBOL, STAR_SYMBOL
 from mpos.content import deeplink
 
@@ -624,6 +624,7 @@ class AppStore(Activity):
                 _pt = time.ticks_ms()
             if self._icon_pipeline == "none":
                 app.image_icon_widget = None
+                item.set_style_pad_hor(DisplayMetrics.pct_of_width(4), lv.PART.MAIN)
             else:
                 icon_spacer = lv.image(item)
                 icon_spacer.set_size(self._ICON_SIZE, self._ICON_SIZE)
