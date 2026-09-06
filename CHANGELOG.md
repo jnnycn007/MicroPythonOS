@@ -2,7 +2,7 @@ Future release (next version)
 =====
 
 Builtin Apps:
-- AppStore: speedup loading from 18 to 9 seconds
+- AppStore: speedup loading from 18 to 6 seconds
 
 Frameworks:
 - InfiniteList: dynamic initial list sizing instead of hard-coded 18 items
