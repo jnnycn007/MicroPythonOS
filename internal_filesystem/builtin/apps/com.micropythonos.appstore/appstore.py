@@ -602,6 +602,12 @@ class AppStore(Activity):
                         continue
                 elif not app.categories or sel_cat not in app.categories:
                     continue
+            # Row-op micro-profile: time each build segment for the first and
+            # sixth built rows (cold vs warmed-up caches). Row count comes
+            # from _n_rows, incremented at the end of the loop body.
+            if __debug__:
+                _prof = (_n_rows == 0 or _n_rows == 5)
+                _pt = time.ticks_ms()
             item = self.apps_list.add_button(None, "")
             item.set_style_pad_all(0, lv.PART.MAIN)
             item.set_size(lv.pct(100), lv.SIZE_CONTENT)
@@ -613,6 +619,9 @@ class AppStore(Activity):
             # icon=None it is child 0: nothing else was added yet.
             if item.get_child_count() > 0:
                 item.get_child(0).delete()
+            if __debug__ and _prof:
+                logger.debug("appstore-perf: row%d button took=%dms", _n_rows, time.ticks_diff(time.ticks_ms(), _pt))
+                _pt = time.ticks_ms()
             if self._icon_pipeline == "none":
                 app.image_icon_widget = None
             else:
@@ -625,6 +634,9 @@ class AppStore(Activity):
                     pass
                 else:
                     self._icon_queue.append((app, 'raw'))
+            if __debug__ and _prof:
+                logger.debug("appstore-perf: row%d icon took=%dms", _n_rows, time.ticks_diff(time.ticks_ms(), _pt))
+                _pt = time.ticks_ms()
             label_cont = lv.obj(item)
             self._apply_default_styles(label_cont)
             label_cont.set_flex_flow(lv.FLEX_FLOW.COLUMN)
@@ -640,6 +652,9 @@ class AppStore(Activity):
             name_row.set_flex_flow(lv.FLEX_FLOW.ROW)
             name_row.set_size(lv.pct(100), lv.SIZE_CONTENT)
             name_row.add_flag(lv.obj.FLAG.EVENT_BUBBLE)
+            if __debug__ and _prof:
+                logger.debug("appstore-perf: row%d containers took=%dms", _n_rows, time.ticks_diff(time.ticks_ms(), _pt))
+                _pt = time.ticks_ms()
             name_label = lv.label(name_row)
             name_label.set_text(app.name)
             name_label.set_style_text_font(lv.font_montserrat_16, lv.PART.MAIN)
@@ -650,6 +665,9 @@ class AppStore(Activity):
                 rating_label.set_text("%s %.1f" % (STAR_SYMBOL, rating_avg))
                 rating_label.set_style_text_font(lv.font_montserrat_12, lv.PART.MAIN)
                 rating_label.set_size(lv.SIZE_CONTENT, lv.SIZE_CONTENT)
+            if __debug__ and _prof:
+                logger.debug("appstore-perf: row%d name took=%dms", _n_rows, time.ticks_diff(time.ticks_ms(), _pt))
+                _pt = time.ticks_ms()
             desc_label = lv.label(label_cont)
             desc_label.set_text(app.short_description)
             desc_label.set_style_text_font(lv.font_montserrat_12, lv.PART.MAIN)
@@ -659,6 +677,8 @@ class AppStore(Activity):
             update_label.set_style_text_color(lv.palette_main(lv.PALETTE.GREEN), lv.PART.MAIN)
             update_label.add_flag(lv.obj.FLAG.HIDDEN)
             self._update_labels[app.fullname] = update_label
+            if __debug__ and _prof:
+                logger.debug("appstore-perf: row%d desc_update took=%dms", _n_rows, time.ticks_diff(time.ticks_ms(), _pt))
             if __debug__:
                 _n_rows += 1
                 if _n_rows % 20 == 0:
