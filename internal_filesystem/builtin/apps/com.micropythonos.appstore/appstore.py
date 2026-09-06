@@ -641,7 +641,7 @@ class AppStore(Activity):
             self._apply_default_styles(label_cont)
             label_cont.set_flex_flow(lv.FLEX_FLOW.COLUMN)
             label_cont.set_style_pad_ver(10, lv.PART.MAIN)
-            label_cont.set_size(lv.pct(75), lv.SIZE_CONTENT)
+            label_cont.set_size(lv.pct(100 if self._icon_pipeline == "none" else 75), lv.SIZE_CONTENT)
             # Every lv.obj is CLICKABLE by default (see lv_obj_init in lvgl
             # lv_obj.c), so row taps land on these containers. The single
             # CLICKED handler on the item covers the whole row only if the
