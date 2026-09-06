@@ -15,7 +15,17 @@ class InfiniteList:
         lst.set_size(lv.pct(100), lv.pct(70))
         lst.center()
         lst.set_data(items, lambda container, idx, item: create_button(...))
+
+    The initial window is sized dynamically: rows are rendered until they
+    fill the container height, plus _LOAD_MARGIN_ROWS extra. The container
+    must be sized before set_data() is called; if its height cannot be
+    determined yet (e.g. percentage sizes before the first layout pass),
+    a fixed fallback window is used and scroll loading tops up the rest.
     """
+
+    _LOAD_MARGIN_ROWS = 3
+    _FALLBACK_INIT_ROWS = 18
+    _TOP_UP_SLACK_ROWS = 8
 
     def __init__(self, parent, load_margin=200, unload_margin=600):
         self._container = lv.obj(parent)
@@ -111,23 +121,56 @@ class InfiniteList:
         if not self._items:
             return
 
-        visible = self._visible_count()
-        n_init = max(3, visible + 3)
-        n_init = min(n_init, len(self._items))
-
         self._first = 0
-        self._last = n_init - 1
-        for i in range(n_init):
-            self._render_cb(self._container, i, self._items[i])
+        self._last = -1
+        target = self._measure_initial_window()
+        while self._last + 1 < target:
+            self._last += 1
+            self._render_cb(self._container, self._last, self._items[self._last])
         self._container.update_layout()
+        self._top_up_to_viewport()
+
+    def _measure_initial_window(self):
+        """How many rows to render up front: fill viewport + margin."""
+        n = len(self._items)
+        self._render_cb(self._container, 0, self._items[0])
+        self._last = 0
+        self._container.update_layout()
+        try:
+            viewport_h = self._container.get_height()
+            row_h = self._container.get_child(0).get_height()
+        except Exception:
+            viewport_h = 0
+            row_h = 0
+        if viewport_h <= 0 or row_h <= 0:
+            return min(n, self._FALLBACK_INIT_ROWS)
+        visible = viewport_h // row_h
+        return min(n, visible + self._LOAD_MARGIN_ROWS)
+
+    def _top_up_to_viewport(self):
+        """Render more rows if short rows left the viewport uncovered."""
+        n = len(self._items)
+        extra = 0
+        while (
+            self._last < n - 1
+            and extra < self._TOP_UP_SLACK_ROWS
+            and self._viewport_uncovered()
+        ):
+            self._last += 1
+            self._render_cb(self._container, self._last, self._items[self._last])
+            self._container.update_layout()
+            extra += 1
+
+    def _viewport_uncovered(self):
+        try:
+            return self._container.get_scroll_bottom() <= 0
+        except Exception:
+            return False
 
     def clean(self):
         self._container.clean()
         self._first = -1
         self._last = -1
-
-    def _visible_count(self):
-        return 15
 
     def _on_scroll(self, event):
         if self._scroll_running:
